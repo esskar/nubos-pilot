@@ -1,0 +1,416 @@
+---
+command: np:plan-phase
+description: Plans a milestone (M<NNN>) — breaks it into slices (waves) and tasks. Spawns np-planner (opus) + np-plan-checker (opus), 2-iteration verification, then scaffolds every task file.
+argument-hint: <milestone-number> [--research] [--repromote]
+---
+
+# np:plan-phase
+
+**Semantic:** `/np:plan-phase 1` plans **Milestone M001** entirely — the milestone's CONTEXT/ROADMAP/META, every slice's PLAN/ASSESSMENT/UAT, and scaffolds every task file under `slices/S<NNN>/tasks/T<NNNN>/`.
+
+A "phase" in this workflow's name equals a **milestone** . Within a milestone, the planner produces:
+
+- **Slices** = execution waves. All tasks inside one slice run in parallel; slices run serially.
+- **Tasks** = atomic executor units (one commit each).
+
+Output layout:
+```
+.nubos-pilot/milestones/M001/
+  M001-CONTEXT.md         ← from /np:discuss-phase (not overwritten)
+  M001-ROADMAP.md         ← slice list + execution order
+  M001-META.json
+  slices/
+    S001/
+      S001-ASSESSMENT.md
+      S001-PLAN.md        ← contains all <task> blocks inline
+      S001-RESEARCH.md    ← optional, from /np:research-phase
+      S001-UAT.md
+      tasks/
+        T0001/T0001-PLAN.md
+        T0001/T0001-SUMMARY.md
+        T0002/T0002-PLAN.md
+        ...
+    S002/
+      ...
+```
+
+## Initialize
+
+### Parse Arguments
+
+```bash
+PHASE=""
+RESEARCH_FLAG=0
+REPROMOTE_FLAG=0
+for arg in "$@"; do
+  case "$arg" in
+    --research)  RESEARCH_FLAG=1 ;;
+    --repromote) REPROMOTE_FLAG=1 ;;
+    --*)         echo "Unknown flag: $arg" >&2; exit 2 ;;
+    *)           [[ -z "$PHASE" ]] && PHASE="$arg" ;;
+  esac
+done
+if [[ -z "$PHASE" ]]; then
+  echo "Usage: /np:plan-phase <milestone-number> [--research] [--repromote]" >&2
+  exit 2
+fi
+```
+
+### Repromote short-circuit
+
+When `--repromote` is set, skip every gate and the verification loop. Read every existing `S<NNN>-PLAN.md` under the milestone, rescaffold task dirs + files. No planner, no plan-checker, no new commits.
+
+```bash
+if [[ "$REPROMOTE_FLAG" == "1" ]]; then
+  SCAFFOLD_JSON=$(node .nubos-pilot/bin/np-tools.cjs init plan-milestone scaffold-all-tasks "$PHASE")
+  if [[ "$SCAFFOLD_JSON" == @file:* ]]; then SCAFFOLD_JSON=$(cat "${SCAFFOLD_JSON#@file:}"); fi
+  echo "repromote: $SCAFFOLD_JSON" >&2
+  exit 0
+fi
+```
+
+### Read milestone state
+
+```bash
+LANG_DIRECTIVE=$(node .nubos-pilot/bin/np-tools.cjs lang-directive)
+INIT=$(node .nubos-pilot/bin/np-tools.cjs init plan-milestone init "$PHASE")
+if [[ "$INIT" == @file:* ]]; then INIT=$(cat "${INIT#@file:}"); fi
+AGENT_SKILLS_PLANNER=$(node .nubos-pilot/bin/np-tools.cjs agent-skills planner 2>/dev/null)
+AGENT_SKILLS_CHECKER=$(node .nubos-pilot/bin/np-tools.cjs agent-skills plan-checker 2>/dev/null)
+RUNTIME=$(node .nubos-pilot/bin/np-tools.cjs detect-runtime)
+```
+
+**Language (SSOT = `.nubos-pilot/config.json` → `response_language`).**
+`$LANG_DIRECTIVE` is authoritative. Obey it for all user-facing output,
+askuser prompts, status updates, and any narrative text the spawned planner
+or plan-checker subagents emit. Pass `$LANG_DIRECTIVE` into their spawn
+prompts as a system-level rule. This supersedes any directive in CLAUDE.md.
+
+Parse JSON for: `milestone`, `milestone_id`, `milestone_dir`, `milestone_context_path`, `milestone_roadmap_path`, `milestone_meta_path`, `name`, `goal`, `requirements`, `success_criteria`, `has_context`, `has_roadmap`, `has_meta`, `existing_slices[]`, `planner_tier`, `checker_tier`, `text_mode`, `text_mode_source`, `agent_skills`.
+
+**Askuser routing.** Every `node .nubos-pilot/bin/np-tools.cjs askuser …` block below is a spec, not a literal command. Pick the path once at Initialize:
+- **Claude Code** (native `AskUserQuestion` tool is available): parse the JSON spec and call `AskUserQuestion` directly. `select` → `multiSelect: false`; `multiselect` → `multiSelect: true`; `confirm` → `options: [{label: "Yes"}, {label: "No"}]`; `input` → ask free-form in chat. Use a short `header` (≤12 chars).
+- **`text_mode == true`** (INIT payload): skip every askuser block and render questions as plain-text numbered lists. Opt-in via `.nubos-pilot/config.json` → `workflow.text_mode`.
+- **Other runtime with TTY** (Codex, Gemini, …): execute the shell `askuser` block verbatim.
+
+`PLAN_ID` and `TASK_ID` default to `${milestone_id}-plan` / `${milestone_id}-planner-run` for the metrics records.
+
+## Pre-Flight Guards
+
+### Gate 1 — Missing M<NNN>-CONTEXT.md
+
+If `has_context == false`:
+
+```bash
+CHOICE=$(node .nubos-pilot/bin/np-tools.cjs askuser --json '{
+  "type": "select",
+  "header": "Missing M'"$PHASE"'-CONTEXT.md",
+  "question": "Milestone CONTEXT.md is not present. Continue?",
+  "options": [
+    {"label": "Run /np:discuss-phase first", "description": "Recommended — capture user decisions before planning."},
+    {"label": "Continue without CONTEXT.md", "description": "Not recommended — planner works from roadmap goal alone."},
+    {"label": "Abort",                       "description": "Exit without changes."}
+  ]
+}')
+case "$CHOICE" in
+  "Run /np:discuss-phase"*) echo "Run: /np:discuss-phase $PHASE"; exit 0 ;;
+  "Abort")                  exit 0 ;;
+esac
+```
+
+### Gate 1b — Empty success_criteria
+
+If `success_criteria.length == 0`:
+
+```bash
+CHOICE=$(node .nubos-pilot/bin/np-tools.cjs askuser --json '{
+  "type": "select",
+  "header": "No SCs in roadmap.yaml",
+  "question": "Milestone has no success_criteria in roadmap.yaml. Downstream /np:verify-work will produce an empty VERIFICATION.md. How to proceed?",
+  "options": [
+    {"label": "Run /np:discuss-phase first", "description": "Recommended — np-sc-extractor derives SCs from CONTEXT.md + goal + requirements and writes them to roadmap.yaml."},
+    {"label": "Continue anyway",             "description": "Plan the milestone without SCs; you must back-fill them before /np:verify-work."},
+    {"label": "Abort",                       "description": "Exit without changes."}
+  ]
+}')
+case "$CHOICE" in
+  "Run /np:discuss-phase"*) echo "Run: /np:discuss-phase $PHASE"; exit 0 ;;
+  "Abort")                  exit 0 ;;
+esac
+```
+
+The planner will still emit a plan without SCs, but you are consciously opting into a known-broken verify-work path. The safer default is always to re-run `/np:discuss-phase` — Step 6b there spawns `np-sc-extractor` which populates `roadmap.yaml` directly.
+
+### Gate 2 — Missing slice RESEARCH.md
+
+Research is per-slice  (`slices/S<NNN>/S<NNN>-RESEARCH.md`). The planner can plan without research, but if the roadmap config requires it, ask. The `--research` flag auto-dispatches `/np:research-phase` before re-entering.
+
+```bash
+if [[ "$RESEARCH_FLAG" == "1" ]]; then
+  echo "research-auto: dispatching /np:research-phase $PHASE before planning" >&2
+  exit 42
+fi
+```
+
+**Exit code 42 contract:** orchestrator sees exit 42 → runs `/np:research-phase $PHASE` → re-enters `/np:plan-phase $PHASE` without the `--research` flag.
+
+**Researcher-Schwarm semantics (ADR-0011).** The dispatched `/np:research-phase` runs in Schwarm mode by default (`swarm.research.k=3`). The cache-bypass at Pre-flight short-circuits the swarm whenever the milestone goal + requirements match a stored learning at similarity ≥ `swarm.research.threshold` and `occurrence ≥ swarm.research.minOccurrence`. The merged consensus carries a `<consensus_meta>` block (`k`, `agreement_score`, `flagged_decisions`) which `np-plan-checker` reads to weight downstream verdicts. No additional flags needed at this site — the swarm runs automatically when `--research` is set.
+
+### Gate 3 — Milestone already planned
+
+If any slice has a `has_plan == true`:
+
+```bash
+CHOICE=$(node .nubos-pilot/bin/np-tools.cjs askuser --json '{
+  "type": "select",
+  "header": "Milestone already planned",
+  "question": "One or more slices already have S<NNN>-PLAN.md. Overwrite?",
+  "options": [
+    {"label": "Overwrite", "description": "Archive existing slice plans; replan the milestone."},
+    {"label": "Repromote", "description": "Skip planner — just rescaffold task files from existing slice plans."},
+    {"label": "Abort",     "description": "Exit without changes."}
+  ]
+}')
+case "$CHOICE" in
+  "Abort") exit 0 ;;
+  "Repromote")
+    node .nubos-pilot/bin/np-tools.cjs init plan-milestone scaffold-all-tasks "$PHASE" >&2
+    exit 0
+    ;;
+  "Overwrite")
+    node .nubos-pilot/bin/np-tools.cjs init plan-milestone abort "$PHASE"
+    ;;
+esac
+```
+
+## Downstream Awareness
+
+**Milestone artefacts feed into:**
+
+1. **plan-checker** — Goal-backward verification at milestone + slice + task level.
+2. **executor** (`/np:execute-phase`) — Reads each slice's `S<NNN>-PLAN.md` + scaffolded `tasks/T<NNNN>/T<NNNN>-PLAN.md` as prompts. Dispatches one executor per task, all tasks of a slice in parallel.
+3. **verifier** (`/np:validate-phase`) — Re-runs goal-backward checks per slice UAT file.
+
+**PLAN-REVIEW.md** lives at milestone level (`M<NNN>-PLAN-REVIEW.md`) — append-only audit trail across slices.
+
+## Scope Guardrail
+
+**Do:**
+- Spawn planner → plan-checker in strict sequence.
+- Append every verdict to `M<NNN>-PLAN-REVIEW.md` before deciding pass/fail.
+- Commit milestone artefacts only after a `passed` verdict OR an explicit "commit-with-warnings" user choice on the iter-2 gate.
+- Run `scaffold-all-tasks` after commit — every `<task>` in every slice becomes a `tasks/T<NNNN>/T<NNNN>-PLAN.md` + `T<NNNN>-SUMMARY.md`.
+
+**Don't:**
+- Run a third planner iteration. The loop is fixed at 2 rounds.
+- Scaffold task files manually — always via `np-tools.cjs init plan-milestone scaffold-all-tasks <N>`.
+- Write task files directly — the planner writes slice plans; the scaffolder writes task files.
+- Invoke host-specific prompt tools directly. Always `np-tools.cjs askuser --json …`.
+
+## Skills (Nubos library)
+
+Before iteration 1, decide whether to pressure-test the planner output with the **`np-council`** skill (`.claude/skills/np-council/SKILL.md`). Trigger the skill on Claude Code when the plan-checker verdict at iteration 1 is `passed` BUT any of the following holds:
+
+- Milestone touches public-facing UX, payments, auth, or data-migration.
+- `>= 4` slices OR `>= 12` tasks (cross-slice dep risk).
+- Goal contains a hard tradeoff ("vs", "instead of", "decide between") that the planner resolved unilaterally.
+
+If triggered, the council pressure-tests the slice-decomposition + execution order before scaffolding. On dissent, re-enter iteration 2 with the council's findings appended to `LAST_FINDINGS`. On consensus, scaffold normally.
+
+For non-UX, low-risk plans (≤ 3 slices, internal tooling, refactors with test coverage), skip — the 2-iteration plan-checker loop is sufficient.
+
+## Verification Loop
+
+```bash
+LAST_FINDINGS=""
+for ITER in 1 2; do
+  MODE="initial"
+  [ "$ITER" = "2" ] && MODE="revise"
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # ACTION CONTRACT — Step 2a: Spawn np-planner
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Execute EXACTLY ONE Agent tool-call (real, not bash):
+  #   Agent(subagent_type="np-planner", model="$PLANNER_MODEL", prompt=<…>)
+  # Prompt fields:
+  #   <mode>$MODE</mode>                         (initial | revise)
+  #   <milestone>$PHASE</milestone>
+  #   <milestone_dir>$milestone_dir</milestone_dir>
+  #   <goal>$goal</goal>
+  #   <requirements>$requirements</requirements>
+  #   <prior_findings>$LAST_FINDINGS</prior_findings>  (path to verdict JSON, R≥2)
+  #   <agent_skills>$AGENT_SKILLS_PLANNER</agent_skills>
+  # Agent MUST: write/update slice plans inside $milestone_dir.
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PLANNER_START=$(node .nubos-pilot/bin/np-tools.cjs metrics start-timestamp)
+  PLANNER_MODEL=$(node .nubos-pilot/bin/np-tools.cjs resolve-model np-planner --profile frontier)
+  # → execute the Agent call per ACTION CONTRACT above, then:
+  PLANNER_END=$(node .nubos-pilot/bin/np-tools.cjs metrics end-timestamp)
+  node .nubos-pilot/bin/np-tools.cjs metrics record \
+    --agent np-planner --tier opus --resolved-model "$PLANNER_MODEL" \
+    --phase "$PHASE" --plan "${milestone_id}-plan" --task "${milestone_id}-planner-run" \
+    --started "$PLANNER_START" --ended "$PLANNER_END" \
+    --tokens-in "${TOKENS_IN:-0}" --tokens-out "${TOKENS_OUT:-0}" \
+    --retry-count 0 --status ok --runtime "$RUNTIME"
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # ACTION CONTRACT — Step 2b: Spawn np-plan-checker (immediately after 2a)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Execute EXACTLY ONE Agent tool-call (real, not bash):
+  #   Agent(subagent_type="np-plan-checker", model="$CHECKER_MODEL", prompt=<…>)
+  # Prompt fields:
+  #   <milestone>$PHASE</milestone>
+  #   <milestone_dir>$milestone_dir</milestone_dir>
+  #   <agent_skills>$AGENT_SKILLS_CHECKER</agent_skills>
+  # Agent MUST: read planner output (slice plans inside $milestone_dir),
+  # write YAML verdict to $milestone_dir/.tmp-verdict-$ITER.yaml. Orchestrator
+  # converts YAML → JSON at $VERDICT_JSON_PATH (next bash section).
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CHECKER_START=$(node .nubos-pilot/bin/np-tools.cjs metrics start-timestamp)
+  CHECKER_MODEL=$(node .nubos-pilot/bin/np-tools.cjs resolve-model np-plan-checker --profile frontier)
+  # → execute the Agent call per ACTION CONTRACT above, then:
+  CHECKER_END=$(node .nubos-pilot/bin/np-tools.cjs metrics end-timestamp)
+  node .nubos-pilot/bin/np-tools.cjs metrics record \
+    --agent np-plan-checker --tier opus --resolved-model "$CHECKER_MODEL" \
+    --phase "$PHASE" --plan "${milestone_id}-plan" --task "${milestone_id}-planner-run" \
+    --started "$CHECKER_START" --ended "$CHECKER_END" \
+    --tokens-in "${TOKENS_IN:-0}" --tokens-out "${TOKENS_OUT:-0}" \
+    --retry-count 0 --status ok --runtime "$RUNTIME"
+
+  VERDICT_JSON_PATH="$milestone_dir/.tmp-verdict-$ITER.json"
+  # (verdict JSON: {status: passed|issues_found, findings: [...] })
+
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # ACTION CONTRACT — Plan-side Trust Layer (ADR-0019, non-overridable)
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # Runs AFTER np-plan-checker writes its verdict, BEFORE reading STATUS.
+  # Execute EXACTLY:
+  #
+  # (1) Run plan-lint over every PLAN.md in the milestone:
+  #       PLAN_LINT_JSON=$(node .nubos-pilot/bin/np-tools.cjs plan-lint \
+  #         --milestone "$milestone_id" 2>&1) || true
+  #
+  # (2) IF $PLAN_LINT_CRITICAL > 0:
+  #       - Write lint JSON to $milestone_dir/.tmp-plan-lint-$ITER.json
+  #       - MERGE lint findings into $VERDICT_JSON_PATH
+  #       - FORCE verdict.status = "issues_found"
+  #     This step is non-negotiable. The LLM verdict cannot override
+  #     mechanical findings (verify-command-unknown,
+  #     parallel-task-implicit-dependency etc.).
+  #
+  # (3) THEN read final STATUS from the merged verdict file.
+  #
+  # Rationale: ADR-0019 — mechanical truth beats LLM judgment.
+  # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PLAN_LINT_JSON=$(node .nubos-pilot/bin/np-tools.cjs plan-lint --milestone "$milestone_id" 2>&1) || true
+  PLAN_LINT_CRITICAL=$(echo "$PLAN_LINT_JSON" | node -e 'process.stdin.on("data",d=>{try{const j=JSON.parse(d);console.log((j.summary&&j.summary.critical)||0)}catch{console.log(0)}})')
+  if [ "${PLAN_LINT_CRITICAL:-0}" -gt 0 ]; then
+    # Promote mechanical findings into the verdict file so iteration-2 sees them.
+    echo "$PLAN_LINT_JSON" > "$milestone_dir/.tmp-plan-lint-$ITER.json"
+    node -e '
+      const fs = require("fs");
+      const verdict = JSON.parse(fs.readFileSync(process.argv[1], "utf-8"));
+      const lint    = JSON.parse(fs.readFileSync(process.argv[2], "utf-8"));
+      const findings = Array.isArray(verdict.findings) ? verdict.findings.slice() : [];
+      for (const f of (lint.files || []).flatMap(x => x.findings || [])) findings.push(f);
+      for (const f of (lint.parallel_race_findings || [])) findings.push(f);
+      verdict.findings = findings;
+      verdict.status = "issues_found";
+      fs.writeFileSync(process.argv[1], JSON.stringify(verdict, null, 2));
+    ' "$VERDICT_JSON_PATH" "$milestone_dir/.tmp-plan-lint-$ITER.json"
+  fi
+
+  # (Plan-review append uses the milestone-id form — append-only audit)
+  # Future: move to plan-milestone plan-review-append verb.
+
+  STATUS=$(node -e "console.log(JSON.parse(require('fs').readFileSync(process.argv[1],'utf-8')).status)" "$VERDICT_JSON_PATH")
+  if [ "$STATUS" = "passed" ]; then
+    break
+  fi
+
+  LAST_FINDINGS="$VERDICT_JSON_PATH"
+
+  if [ "$ITER" = "2" ]; then
+    CHOICE=$(node .nubos-pilot/bin/np-tools.cjs askuser --json '{
+      "type": "select",
+      "header": "Plan-Checker Stall",
+      "question": "Plan-Checker hat 2 Iterationen lang Fail gemeldet. Was tun?",
+      "options": [
+        {"label": "Plan mit Warnings committen",        "description": "Milestone-Artefakte werden committet; Audit bleibt."},
+        {"label": "Abort (Plan verwerfen)",             "description": "Slice-Verzeichnisse werden entfernt, Milestone-Dir bleibt."},
+        {"label": "Manuell editieren und erneut prüfen", "description": "Plan-Checker wird nach manueller Bearbeitung neu aufgerufen."}
+      ]
+    }')
+    case "$CHOICE" in
+      "Abort"*)
+        node .nubos-pilot/bin/np-tools.cjs init plan-milestone abort "$PHASE"
+        exit 1
+        ;;
+      "Plan mit Warnings"*) break ;;
+      "Manuell editieren"*)
+        node .nubos-pilot/bin/np-tools.cjs askuser --json '{"type":"input","question":"Edit slice plans in your editor, then press Enter to re-check."}'
+        break
+        ;;
+    esac
+  fi
+done
+```
+
+## Scaffold Task Files
+
+After a successful verification (or "commit-with-warnings"), scaffold every `<task>` block into its own directory + files:
+
+```bash
+SCAFFOLD_JSON=$(node .nubos-pilot/bin/np-tools.cjs init plan-milestone scaffold-all-tasks "$PHASE")
+if [[ "$SCAFFOLD_JSON" == @file:* ]]; then SCAFFOLD_JSON=$(cat "${SCAFFOLD_JSON#@file:}"); fi
+echo "scaffold-all-tasks → $SCAFFOLD_JSON" >&2
+```
+
+The scaffolder:
+- reads every `slices/S<NNN>/S<NNN>-PLAN.md`
+- extracts `<task>` blocks (requires `id`/`depends_on`/`wave`/`tier` attributes)
+- creates `slices/S<NNN>/tasks/T<NNNN>/` directory per task
+- writes `T<NNNN>-PLAN.md` (from the `<task>` body) and a stubbed `T<NNNN>-SUMMARY.md`
+- is idempotent — never overwrites existing task files
+
+## Commit
+
+```bash
+COMMIT_ARTIFACTS=$(node .nubos-pilot/bin/np-tools.cjs config-get workflow.commit_artifacts 2>/dev/null || echo "true")
+if [[ "$COMMIT_ARTIFACTS" != "false" ]]; then
+  git add "$milestone_dir"
+  git commit -m "docs(${milestone_id}): milestone plan ready for execute"
+fi
+```
+
+Commits include: all milestone-level artefacts (CONTEXT/ROADMAP/META), every slice's ASSESSMENT/PLAN/UAT, and every scaffolded task file.
+
+## Abort path
+
+If the user chose "Abort" at the iter-2 gate, `plan-milestone abort` removes all slice dirs but preserves the milestone dir. Exit 1.
+
+## Structured results
+
+Return to the orchestrator:
+
+```
+status:       passed | committed-with-warnings | aborted | manual-edit | research-dispatched | repromoted
+iterations:   1 | 2 | 3
+milestone:    M<NNN>
+milestone_dir: <absolute path>
+slice_count:  <N>
+task_count:   <total tasks scaffolded>
+```
+
+`research-dispatched` (exit 42) signals the orchestrator to run `/np:research-phase $PHASE` and re-enter afterwards.
+## Definition of Done
+
+This workflow exits successfully only when, per [`templates/COMPLETENESS.md`](../templates/COMPLETENESS.md):
+
+- Rule 1 (Do the whole thing) — every slice in scope has a `S<NNN>-PLAN.md` with inline `<task>` blocks and `S<NNN>-UAT.md` acceptance.
+- Rule 3 (Do it with tests) — every executor task has a `verify` command in its frontmatter.
+- Rule 4 (Do it with documentation) — every milestone plan includes a doc-update task per affected module.
+- Rule 6 (Never table) — `np-plan-checker` rejects "stub" / "placeholder" acceptance criteria; the loop runs until plan-checker returns `passed`.
+- Rule 11 (Ship the complete thing) — plan is executor-ready; no further interpretation needed.
+
+Any violation = workflow exits non-zero. The orchestrator does not relax these.

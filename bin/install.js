@@ -1,0 +1,890 @@
+#!/usr/bin/env node
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+
+const { atomicWriteFileSync, withFileLock, installSignalCleanup, NubosPilotError } = require('../lib/core.cjs');
+const { askUser: defaultAskUser } = require('../lib/askuser.cjs');
+const manifestMod = require('../lib/install/manifest.cjs');
+const stagingMod = require('../lib/install/staging.cjs');
+const managedBlockMod = require('../lib/install/managed-block.cjs');
+const agentsMdMod = require('../lib/install/agents-md.cjs');
+const codexTomlMod = require('../lib/install/codex-toml.cjs');
+const runtimeDetectMod = require('../lib/install/runtime-detect.cjs');
+const backupMod = require('../lib/install/backup.cjs');
+const registryMod = require('../lib/install/runtimes-registry.cjs');
+const runtimeAssetsMod = require('../lib/install/runtime-assets.cjs');
+const languageMod = require('../lib/language.cjs');
+const configDefaults = require('../lib/config-defaults.cjs');
+
+const cyan = '\x1b[36m', green = '\x1b[32m', yellow = '\x1b[33m',
+      red = '\x1b[31m', blue = '\x1b[38;5;33m',
+      dim = '\x1b[2m', bold = '\x1b[1m', reset = '\x1b[0m';
+
+const LOGO = [
+  ' ███╗   ██╗██╗   ██╗██████╗  ██████╗ ███████╗',
+  ' ████╗  ██║██║   ██║██╔══██╗██╔═══██╗██╔════╝',
+  ' ██╔██╗ ██║██║   ██║██████╔╝██║   ██║███████╗',
+  ' ██║╚██╗██║██║   ██║██╔══██╗██║   ██║╚════██║',
+  ' ██║ ╚████║╚██████╔╝██████╔╝╚██████╔╝███████║',
+  ' ╚═╝  ╚═══╝ ╚═════╝ ╚═════╝  ╚═════╝ ╚══════╝',
+];
+
+function _printBanner() {
+  let pkgVersion = '0.0.0';
+  let pkgDesc = '';
+  try {
+    const pkg = require('../package.json');
+    pkgVersion = String(pkg.version || '0.0.0');
+    pkgDesc = String(pkg.description || '');
+  } catch {}
+  process.stderr.write('\n');
+  for (const line of LOGO) process.stderr.write(blue + line + reset + '\n');
+  process.stderr.write('\n');
+  process.stderr.write(' ' + bold + blue + 'Nubos Pilot' + reset
+    + dim + ' v' + pkgVersion + reset + '\n');
+  if (pkgDesc) process.stderr.write(' ' + dim + pkgDesc + reset + '\n');
+  process.stderr.write('\n');
+}
+
+const PAYLOAD_SUBPATH = path.join('.claude', 'nubos-pilot');
+const STATE_SUBPATH = '.nubos-pilot';
+const SOURCE_PAYLOAD_DIR = path.join(__dirname, '..', 'templates', 'claude', 'payload');
+const OPENCODE_SUBPATH = path.join('.opencode', 'nubos-pilot');
+const OPENCODE_MANIFEST_PREFIX = '.opencode/nubos-pilot/';
+const SOURCE_OPENCODE_DIR = path.join(__dirname, '..', 'templates', 'opencode', 'payload');
+const OPENCODE_JSON_TEMPLATE = path.join(__dirname, '..', 'templates', 'opencode', 'opencode.json');
+const SOURCE_WORKFLOWS_DIR = path.join(__dirname, '..', 'workflows');
+const SOURCE_AGENTS_DIR = path.join(__dirname, '..', 'agents');
+const SOURCE_SKILLS_DIR = path.join(__dirname, '..', 'skills');
+
+function _autoAskUser(spec) {
+  return Promise.resolve({
+    value: spec && spec.default !== undefined ? spec.default : null,
+    source: 'auto',
+  });
+}
+
+function _managedBlockInner(responseLanguage) {
+  return (
+    'This project uses [nubos-pilot](https://github.com/nubos/nubos-pilot)'
+    + ' for planning and execution.\n\n'
+    + languageMod.buildDirective(responseLanguage)
+    + '\n\nRun `npx nubos-pilot doctor` to check install integrity.'
+  );
+}
+
+const VALID_AGENTS = registryMod.listRuntimeIds();
+const VALID_SCOPES = ['local', 'global'];
+
+function _parseAgentsFlag(value) {
+  return String(value || '')
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function parseInstallFlags(args) {
+  const flags = { agent: null, agents: null, scope: null, yes: false };
+  const rest = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--agent' || a === '-a') { flags.agent = args[++i] || null; continue; }
+    if (a.startsWith('--agent=')) { flags.agent = a.slice('--agent='.length); continue; }
+    if (a === '--agents') { flags.agents = _parseAgentsFlag(args[++i]); continue; }
+    if (a.startsWith('--agents=')) { flags.agents = _parseAgentsFlag(a.slice('--agents='.length)); continue; }
+    if (a === '--all') { flags.agents = VALID_AGENTS.slice(); continue; }
+    if (a === '--scope' || a === '-s') { flags.scope = args[++i] || null; continue; }
+    if (a.startsWith('--scope=')) { flags.scope = a.slice('--scope='.length); continue; }
+    if (a === '--yes' || a === '-y') { flags.yes = true; continue; }
+    rest.push(a);
+  }
+  if (flags.agent !== null && !VALID_AGENTS.includes(flags.agent)) {
+    throw new NubosPilotError('invalid-flag',
+      '--agent must be one of: ' + VALID_AGENTS.join(', '),
+      { flag: '--agent', got: flags.agent });
+  }
+  if (flags.agents !== null) {
+    for (const a of flags.agents) {
+      if (!VALID_AGENTS.includes(a)) {
+        throw new NubosPilotError('invalid-flag',
+          '--agents values must be one of: ' + VALID_AGENTS.join(', '),
+          { flag: '--agents', got: a });
+      }
+    }
+    if (flags.agents.length === 0) {
+      throw new NubosPilotError('invalid-flag',
+        '--agents requires at least one value',
+        { flag: '--agents' });
+    }
+    if (!flags.agent) flags.agent = flags.agents[0];
+  }
+  if (flags.scope !== null && !VALID_SCOPES.includes(flags.scope)) {
+    throw new NubosPilotError('invalid-flag',
+      '--scope must be one of: ' + VALID_SCOPES.join(', '),
+      { flag: '--scope', got: flags.scope });
+  }
+  return { flags, rest };
+}
+
+function _payloadDirFor(projectRoot, scope) {
+  if (scope === 'global') return path.join(os.homedir(), '.claude', 'nubos-pilot');
+  return path.join(projectRoot, PAYLOAD_SUBPATH);
+}
+
+function _opencodePayloadDirFor(projectRoot, scope) {
+  if (scope === 'global') return path.join(os.homedir(), '.config', 'opencode', 'nubos-pilot');
+  return path.join(projectRoot, OPENCODE_SUBPATH);
+}
+
+function _opencodeManifestPrefix(scope) {
+  return scope === 'global'
+    ? '~/.config/opencode/nubos-pilot/'
+    : OPENCODE_MANIFEST_PREFIX;
+}
+
+// Bins the workflows reference via `node .nubos-pilot/bin/<name>`. Each one
+// gets a thin shim in the project's bin dir that re-execs the npm-installed
+// target. New bins added at the source side must be added here too — the
+// installer doesn't autodiscover.
+const PROJECT_BIN_SHIMS = [
+  { name: 'np-tools.cjs',          targetRel: '../np-tools.cjs',          mode: 'main' },
+  { name: 'researcher-merge.cjs',  targetRel: 'researcher-merge.cjs',     mode: 'spawn' },
+];
+
+function _renderShim(target, mode) {
+  if (mode === 'main') {
+    return '#!/usr/bin/env node\n'
+      + "'use strict';\n"
+      + 'const fs = require(\'node:fs\');\n'
+      + 'if (Number(process.versions.node.split(\'.\')[0]) < 22) {\n'
+      + '  process.stderr.write("nubos-pilot: requires Node >= 22 (running " + process.versions.node + ")\\n");\n'
+      + '  process.exit(1);\n'
+      + '}\n'
+      + 'const TARGET = ' + JSON.stringify(target) + ';\n'
+      + 'if (!fs.existsSync(TARGET)) {\n'
+      + '  process.stderr.write("nubos-pilot: tool binary fehlt unter " + TARGET + "\\nFix: npx nubos-pilot@latest update\\n");\n'
+      + '  process.exit(1);\n'
+      + '}\n'
+      + 'require(TARGET).main();\n';
+  }
+  return '#!/usr/bin/env node\n'
+    + "'use strict';\n"
+    + 'const fs = require(\'node:fs\');\n'
+    + 'const { spawn } = require(\'node:child_process\');\n'
+    + 'if (Number(process.versions.node.split(\'.\')[0]) < 22) {\n'
+    + '  process.stderr.write("nubos-pilot: requires Node >= 22 (running " + process.versions.node + ")\\n");\n'
+    + '  process.exit(1);\n'
+    + '}\n'
+    + 'const TARGET = ' + JSON.stringify(target) + ';\n'
+    + 'if (!fs.existsSync(TARGET)) {\n'
+    + '  process.stderr.write("nubos-pilot: tool binary fehlt unter " + TARGET + "\\nFix: npx nubos-pilot@latest update\\n");\n'
+    + '  process.exit(1);\n'
+    + '}\n'
+    + 'const child = spawn(process.execPath, [TARGET, ...process.argv.slice(2)], { stdio: \'inherit\' });\n'
+    + 'child.on(\'error\', (err) => { process.stderr.write("nubos-pilot shim: " + (err && err.message ? err.message : String(err)) + "\\n"); process.exit(1); });\n'
+    + 'for (const s of [\'SIGINT\', \'SIGTERM\', \'SIGHUP\']) { process.on(s, () => { try { child.kill(s); } catch {} }); }\n'
+    + 'child.on(\'exit\', (code, sig) => { if (sig) process.kill(process.pid, sig); else process.exit(code == null ? 1 : code); });\n';
+}
+
+function _writeToolsShim(projectRoot) {
+  const shimDir = path.join(projectRoot, STATE_SUBPATH, 'bin');
+  fs.mkdirSync(shimDir, { recursive: true });
+  let primary = null;
+  for (const spec of PROJECT_BIN_SHIMS) {
+    const shimPath = path.join(shimDir, spec.name);
+    const target = path.resolve(__dirname, spec.targetRel);
+    atomicWriteFileSync(shimPath, _renderShim(target, spec.mode));
+    try { fs.chmodSync(shimPath, 0o755); } catch {}
+    if (spec.name === 'np-tools.cjs') primary = shimPath;
+  }
+  return primary;
+}
+
+function _stateDirFor(projectRoot) {
+  return path.join(projectRoot, STATE_SUBPATH);
+}
+
+function _readInstallConfig(projectRoot) {
+  const cfgPath = path.join(_stateDirFor(projectRoot), 'config.json');
+  if (!fs.existsSync(cfgPath)) return null;
+  const { _CONFIG_PARSE_CODES, readConfig } = require('../lib/config.cjs');
+  const { NubosPilotError } = require('../lib/core.cjs');
+  try {
+    return readConfig(projectRoot);
+  } catch (err) {
+    if (err && err.code === 'not-in-project') return null;
+    if (err && _CONFIG_PARSE_CODES.has(err.code)) {
+      throw new NubosPilotError(
+        'install-config-unusable',
+        'install refused — .nubos-pilot/config.json is unusable (' + err.code
+          + '). Repair or delete the file and re-run.',
+        { cause: err.code },
+      );
+    }
+    throw err;
+  }
+}
+
+function _readExistingScope(projectRoot) {
+  const cfg = _readInstallConfig(projectRoot);
+  return cfg && cfg.scope ? cfg.scope : null;
+}
+
+function _readExistingRuntimes(projectRoot) {
+  const cfg = _readInstallConfig(projectRoot);
+  if (!cfg) return null;
+  if (Array.isArray(cfg.runtimes) && cfg.runtimes.length) return cfg.runtimes.slice();
+  if (cfg.runtime) return [cfg.runtime];
+  return null;
+}
+
+function detectMode(projectRoot, scope) {
+  const s = scope || _readExistingScope(projectRoot) || 'local';
+  const payloadDir = _payloadDirFor(projectRoot, s);
+  return manifestMod.readManifest(payloadDir) ? 're-install' : 'init';
+}
+
+function _copyTree(src, dst) {
+  let entries;
+  try {
+    entries = fs.readdirSync(src, { withFileTypes: true });
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return;
+    throw err;
+  }
+  fs.mkdirSync(dst, { recursive: true });
+  for (const e of entries) {
+    const from = path.join(src, e.name);
+    const to = path.join(dst, e.name);
+    if (e.isDirectory()) {
+      _copyTree(from, to);
+    } else if (e.isFile()) {
+      fs.copyFileSync(from, to);
+    }
+  }
+}
+
+function _runtimeSelectLabels() {
+  return registryMod.RUNTIMES.map((r) => {
+    const home = registryMod.runtimeGlobalDir(r).replace(process.env.HOME || '', '~');
+    return r.label + '  (' + home + ')';
+  });
+}
+
+async function _runInitQuestions(detectedRuntime, askUser, flags) {
+  const f = flags || {};
+  let runtimes;
+  if (f.agents && f.agents.length) {
+    runtimes = f.agents.slice();
+  } else if (f.agent) {
+    runtimes = [f.agent];
+  } else {
+    const labels = _runtimeSelectLabels();
+    const detectedIdx = Math.max(0, VALID_AGENTS.indexOf(detectedRuntime || 'claude'));
+    const picked = (await askUser({ type: 'multiselect',
+      question: 'Which runtime(s) would you like to install for?',
+      options: labels, default: [labels[detectedIdx]] })).value;
+    runtimes = Array.isArray(picked) && picked.length && typeof picked[0] === 'string'
+      && picked[0].includes('(')
+      ? picked.map((label) => {
+          const idx = labels.indexOf(label);
+          return VALID_AGENTS[idx];
+        })
+      : (Array.isArray(picked) ? picked : [picked]);
+  }
+  const runtime = runtimes[0];
+  const scope = f.scope || (await askUser({ type: 'select', question: 'Installation scope?',
+    options: VALID_SCOPES, default: 'local' })).value;
+  const model_profile = (await askUser({ type: 'select', question: 'Model-Profile?',
+    options: ['frontier', 'quality', 'balanced', 'budget', 'inherit'], default: 'frontier' })).value;
+  const response_language = (await askUser({ type: 'input', question: 'Response language (ISO-639 code)?', default: 'en' })).value;
+  // Wizard / --yes default is intentionally `false` (safer-by-default per
+  // FIX-B2) even though the implicit code default lives at `true` in
+  // DEFAULT_WORKFLOW (ADR-0004). The two are NOT in drift: explicit answer
+  // overrides default; absent key falls back to ADR-0004 true. This is
+  // covered by tests/install/install-flags.test.cjs:85.
+  const commit_artifacts = (await askUser({ type: 'confirm',
+    question: 'Auto-commit nubos-pilot planning artefacts (.nubos-pilot/ — milestones, roadmap, learnings) into your git repo?',
+    default: false })).value;
+  return configDefaults.buildInstallConfig({
+    runtime, runtimes, scope,
+    model_profile,
+    response_language,
+    commit_artifacts,
+  });
+}
+
+function _repairCodexConfig() {
+  const codexConfig = path.join(os.homedir(), '.codex', 'config.toml');
+  if (!fs.existsSync(codexConfig)) return false;
+  let raw;
+  try { raw = fs.readFileSync(codexConfig, 'utf-8'); } catch { return false; }
+  if (!codexTomlMod.hasTrappedFeatures(raw)) return false;
+  const repaired = codexTomlMod.repairTrappedFeatures(raw);
+  atomicWriteFileSync(codexConfig, repaired);
+  console.error(green + '  [codex] trapped [features] repariert' + reset);
+  return true;
+}
+
+const LEGACY_AGENTS = new Set(['claude', 'codex', 'gemini', 'opencode']);
+
+const DEFAULT_CLAUDE_MD = '# CLAUDE.md\n\n'
+  + 'Project guidance for Claude Code. Add project-specific instructions above the'
+  + ' managed block — `npx nubos-pilot` only rewrites the block between the markers.\n';
+
+function _rewriteManagedMarkdown(projectRoot, runtimes, responseLanguage) {
+  const innerMd = _managedBlockInner(responseLanguage);
+  const claudePath = path.join(projectRoot, 'CLAUDE.md');
+  const claudeBase = fs.existsSync(claudePath)
+    ? fs.readFileSync(claudePath, 'utf-8')
+    : DEFAULT_CLAUDE_MD;
+  const claudeRendered = managedBlockMod.rewriteBlock(claudeBase, innerMd);
+
+  const ids = Array.isArray(runtimes) && runtimes.length ? runtimes : ['claude'];
+  const written = new Set();
+  for (const id of ids) {
+    if (id === 'opencode') continue;
+    const meta = registryMod.getRuntimeMeta(id);
+    if (!meta) continue;
+    const targetPath = registryMod.runtimeAgentsPath(meta, 'local', projectRoot);
+    if (written.has(targetPath)) continue;
+    written.add(targetPath);
+
+    if (id === 'claude' && path.resolve(targetPath) === path.resolve(claudePath)) {
+      fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+      atomicWriteFileSync(targetPath, claudeRendered);
+      continue;
+    }
+
+    const base = fs.existsSync(targetPath)
+      ? fs.readFileSync(targetPath, 'utf-8')
+      : agentsMdMod.generateAgentsMd(claudeRendered, id);
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    atomicWriteFileSync(targetPath, managedBlockMod.rewriteBlock(base, innerMd));
+  }
+
+  const stalePaths = [claudePath, path.join(projectRoot, 'AGENTS.md'), path.join(projectRoot, 'GEMINI.md')];
+  for (const p of stalePaths) {
+    if (written.has(p)) continue;
+    if (!fs.existsSync(p)) continue;
+    const current = fs.readFileSync(p, 'utf-8');
+    const stripped = managedBlockMod.stripBlock(current);
+    if (stripped.trim().length === 0) {
+      try { fs.unlinkSync(p); } catch {}
+    } else if (stripped !== current) {
+      atomicWriteFileSync(p, stripped);
+    }
+  }
+}
+
+async function runInstall(opts) {
+  const o = opts || {};
+  const projectRoot = o.projectRoot || o.cwd || process.cwd();
+  const flags = o.flags || {};
+  const mode = o.mode || detectMode(projectRoot, flags.scope);
+  const dryRun = !!o.dryRun;
+  const askUser = flags.yes ? _autoAskUser : (o.askUser || defaultAskUser);
+  const sourceDir = o.sourceDir || SOURCE_PAYLOAD_DIR;
+  const stateDir = _stateDirFor(projectRoot);
+  fs.mkdirSync(stateDir, { recursive: true });
+  return withFileLock(path.join(stateDir, '.install.lock'),
+    () => _runInstallLocked({ projectRoot, mode, dryRun, askUser, sourceDir, stateDir, flags }),
+    { timeoutMs: 60000 });
+}
+
+async function _runInstallLocked(ctx) {
+  const { projectRoot, mode, dryRun, askUser, sourceDir, stateDir, flags } = ctx;
+  _printBanner();
+  console.error(cyan + '→ nubos-pilot install (mode=' + mode + ')' + reset);
+
+  const preliminaryScope = (flags && flags.scope) || _readExistingScope(projectRoot) || 'local';
+  const preliminaryBase = preliminaryScope === 'global' ? os.homedir() : projectRoot;
+  stagingMod.cleanStaleStaging(preliminaryBase);
+
+  let initConfig = null;
+  if (mode === 'init') {
+    const det = runtimeDetectMod.detectRuntime({ cwd: projectRoot });
+    const config = await _runInitQuestions(det && det.runtime, askUser, flags);
+    if (flags && flags.agent) {
+      config.runtime = flags.agent;
+      config.runtime_source = 'flag';
+    } else {
+      config.runtime = det && det.runtime ? det.runtime : config.runtime || 'codex';
+      config.runtime_source = det && det.source ? det.source : 'asked';
+    }
+    const configPath = path.join(stateDir, 'config.json');
+    if (!dryRun) atomicWriteFileSync(configPath, JSON.stringify(config, null, 2));
+    else console.error(dim + 'DRY-RUN: würde schreiben ' + configPath + reset);
+    initConfig = config;
+  }
+
+  const resolvedScope = (initConfig && initConfig.scope) || preliminaryScope;
+  const payloadBase = resolvedScope === 'global' ? os.homedir() : projectRoot;
+  const payloadDir = _payloadDirFor(projectRoot, resolvedScope);
+  const oldManifest = manifestMod.readManifest(payloadDir);
+  const tmp = stagingMod.stageDir(payloadBase);
+  _copyTree(sourceDir, tmp);
+  let pkgVersion = '0.0.0';
+  try { pkgVersion = String(require('../package.json').version || '0.0.0'); } catch {}
+  const newManifest = manifestMod.buildManifest(tmp, pkgVersion);
+
+  const selectedRuntimesEarly = (initConfig && initConfig.runtimes)
+    || (initConfig ? [initConfig.runtime] : null)
+    || _readExistingRuntimes(projectRoot)
+    || [];
+  const opencodeSelected = selectedRuntimesEarly.includes('opencode');
+
+  const assetPlans = runtimeAssetsMod.planRuntimeAssets({
+    selectedRuntimes: selectedRuntimesEarly,
+    scope: resolvedScope,
+    projectRoot,
+    workflowsDir: SOURCE_WORKFLOWS_DIR,
+    agentsDir: SOURCE_AGENTS_DIR,
+    skillsDir: SOURCE_SKILLS_DIR,
+  });
+  const assetEntries = runtimeAssetsMod.manifestEntriesForPlans(assetPlans);
+  for (const k of Object.keys(assetEntries)) {
+    newManifest.files[k] = assetEntries[k];
+  }
+
+  const opencodeTarget = _opencodePayloadDirFor(projectRoot, resolvedScope);
+  const opencodeManifestPrefix = _opencodeManifestPrefix(resolvedScope);
+  const opencodeTmp = path.join(stateDir, '.opencode.tmp');
+  try { fs.rmSync(opencodeTmp, { recursive: true, force: true }); } catch {}
+  try {
+  let opencodeManifest = null;
+  if (opencodeSelected && fs.existsSync(SOURCE_OPENCODE_DIR)) {
+    _copyTree(SOURCE_OPENCODE_DIR, opencodeTmp);
+    opencodeManifest = manifestMod.buildManifest(opencodeTmp, pkgVersion);
+    for (const rel of Object.keys(opencodeManifest.files)) {
+      if (rel.includes('..') || path.isAbsolute(rel)) {
+        throw new NubosPilotError('manifest-path-traversal',
+          'Opencode payload contains suspicious path', { rel });
+      }
+      newManifest.files[opencodeManifestPrefix + rel] = opencodeManifest.files[rel];
+    }
+  }
+  const diff = manifestMod.diffManifests(oldManifest, newManifest);
+
+  const backupLog = [];
+  for (const rel of diff.changed) {
+    const existing = path.join(payloadDir, rel);
+    if (!fs.existsSync(existing)) continue;
+    try {
+      const existingHash = manifestMod.fileHashSync(existing);
+      const oldHash = (oldManifest && oldManifest.files && oldManifest.files[rel]) || null;
+      if (oldHash && existingHash !== oldHash) {
+        if (!dryRun) {
+          const backedUp = backupMod.backupFile(existing);
+          backupLog.push({ rel, backedUp });
+          console.error(yellow + '  [conflict] ' + rel + ' → ' + path.basename(backedUp) + reset);
+        } else {
+          console.error(dim + 'DRY-RUN: würde sichern ' + rel + reset);
+        }
+      }
+    } catch {}
+  }
+
+  if (dryRun) {
+    const summary = { mode, dryRun: true,
+      scope: resolvedScope,
+      wouldWrite: Object.keys(newManifest.files).length,
+      wouldBackup: backupLog.length, wouldDelete: diff.stale.length,
+      wouldWriteGemini: selectedRuntimesEarly.includes('gemini'),
+      wouldWriteOpencodeJson: opencodeSelected && !fs.existsSync(path.join(projectRoot, 'opencode.json')),
+      stale: diff.stale, changed: diff.changed, added: diff.added };
+    process.stdout.write(JSON.stringify(summary, null, 2) + '\n');
+    try { stagingMod.cleanStaleStaging(payloadBase); } catch {}
+    try { fs.rmSync(opencodeTmp, { recursive: true, force: true }); } catch {}
+    return summary;
+  }
+
+  if (fs.existsSync(payloadDir) && fs.lstatSync(payloadDir).isSymbolicLink()) {
+    try { stagingMod.cleanStaleStaging(payloadBase); } catch {}
+    throw new NubosPilotError('target-is-symlink',
+      'Refusing to swap into a symlink target: ' + payloadDir, { payloadDir });
+  }
+
+  stagingMod.finalizeSwap(payloadBase);
+  const resolvedPayloadDir = path.resolve(payloadDir);
+  for (const rel of diff.stale) {
+    manifestMod.assertSafeManifestKey(rel, 'install-stale-cleanup');
+    const abs = path.join(payloadDir, rel);
+    const resolvedAbs = path.resolve(abs);
+    if (!(resolvedAbs === resolvedPayloadDir || resolvedAbs.startsWith(resolvedPayloadDir + path.sep))) {
+      throw new NubosPilotError(
+        'manifest-unlink-outside-base',
+        'Refusing unlink that escapes payloadDir',
+        { rel, base: path.basename(payloadDir) },
+      );
+    }
+    try { fs.unlinkSync(abs); } catch {}
+  }
+
+  if (opencodeManifest) {
+    const opencodeBak = path.join(stateDir, '.opencode.bak');
+    try { fs.rmSync(opencodeBak, { recursive: true, force: true }); } catch {}
+    if (fs.existsSync(opencodeTarget)) {
+      if (fs.lstatSync(opencodeTarget).isSymbolicLink()) {
+        throw new NubosPilotError('target-is-symlink',
+          'Refusing to swap into a symlink target: ' + opencodeTarget,
+          { payloadDir: opencodeTarget });
+      }
+      fs.renameSync(opencodeTarget, opencodeBak);
+    }
+    const opencodeParent = path.dirname(opencodeTarget);
+    if (fs.existsSync(opencodeParent) && fs.lstatSync(opencodeParent).isSymbolicLink()) {
+      throw new NubosPilotError('target-is-symlink',
+        'Refusing to install into a symlinked parent: ' + opencodeParent,
+        { payloadDir: opencodeParent });
+    }
+    fs.mkdirSync(opencodeParent, { recursive: true });
+    fs.renameSync(opencodeTmp, opencodeTarget);
+    try { fs.rmSync(opencodeBak, { recursive: true, force: true }); } catch {}
+    const opencodeBase = resolvedScope === 'global' ? os.homedir() : projectRoot;
+    for (const rel of diff.stale) {
+      if (rel.startsWith(opencodeManifestPrefix)) {
+        manifestMod.assertSafeManifestKey(rel, 'install-opencode-stale');
+        const relFs = rel.startsWith('~/')
+          ? path.join(os.homedir(), rel.slice(2))
+          : path.join(opencodeBase, rel);
+        const expectedBase = rel.startsWith('~/') ? os.homedir() : opencodeBase;
+        const resolvedRelFs = path.resolve(relFs);
+        const resolvedExpected = path.resolve(expectedBase);
+        if (!(resolvedRelFs === resolvedExpected || resolvedRelFs.startsWith(resolvedExpected + path.sep))) {
+          throw new NubosPilotError(
+            'manifest-unlink-outside-base',
+            'Refusing opencode unlink that escapes its base',
+            { rel, base: path.basename(expectedBase) },
+          );
+        }
+        try { fs.unlinkSync(relFs); } catch {}
+      }
+    }
+  } else if (!opencodeSelected && fs.existsSync(opencodeTarget)) {
+    try { fs.rmSync(opencodeTarget, { recursive: true, force: true }); } catch {}
+    const opencodeParent = path.dirname(opencodeTarget);
+    try { fs.rmdirSync(opencodeParent); } catch {}
+    const projectOpencodeJson = path.join(projectRoot, 'opencode.json');
+    if (fs.existsSync(projectOpencodeJson) && fs.existsSync(OPENCODE_JSON_TEMPLATE)) {
+      try {
+        const template = fs.readFileSync(OPENCODE_JSON_TEMPLATE, 'utf-8');
+        const existing = fs.readFileSync(projectOpencodeJson, 'utf-8');
+        if (existing === template) fs.unlinkSync(projectOpencodeJson);
+      } catch {}
+    }
+  }
+
+  const selectedRuntimes = (initConfig && initConfig.runtimes) || (initConfig ? [initConfig.runtime] : []);
+  const responseLanguage = initConfig && initConfig.response_language;
+  _rewriteManagedMarkdown(projectRoot, selectedRuntimes, responseLanguage);
+
+  if (assetPlans.length) {
+    runtimeAssetsMod.writeRuntimeAssets(assetPlans);
+  }
+  const assetStale = diff.stale.filter(runtimeAssetsMod.isAssetManifestKey);
+  if (assetStale.length) {
+    runtimeAssetsMod.removeStaleAssets(assetStale, resolvedScope, projectRoot);
+  }
+
+  try { _writeToolsShim(projectRoot); } catch (err) {
+    console.error(yellow + '  [shim] np-tools shim skipped: ' + (err && err.message) + reset);
+  }
+
+  if (opencodeSelected) {
+    const projectOpencodeJson = path.join(projectRoot, 'opencode.json');
+    if (!fs.existsSync(projectOpencodeJson) && fs.existsSync(OPENCODE_JSON_TEMPLATE)) {
+      const template = fs.readFileSync(OPENCODE_JSON_TEMPLATE, 'utf-8');
+      atomicWriteFileSync(projectOpencodeJson, template);
+    }
+  }
+
+  try { _repairCodexConfig(); } catch (err) {
+    console.error(yellow + '  [codex] repair skipped: ' + (err && err.message) + reset);
+  }
+  manifestMod.writeManifest(payloadDir, newManifest);
+  if (selectedRuntimesEarly.includes('claude')) {
+    try {
+      const claudeHooks = require('../lib/install/claude-hooks.cjs');
+      const res = claudeHooks.installClaudeHooks({
+        projectRoot, scope: resolvedScope, which: 'all', force: false,
+      });
+      const secAction = res.results.security
+        ? Object.values(res.results.security).every((r) => r.action === 'installed') ? 'installed'
+          : Object.values(res.results.security).every((r) => r.action === 'updated') ? 'updated' : 'mixed'
+        : 'skipped';
+      console.error(dim + '  [claude-hooks] statusline: ' + res.results.statusline.action
+        + ', ctx-monitor: ' + res.results.ctxMonitor.action
+        + ', security: ' + secAction + reset);
+      if (res.results.statusline.action === 'skipped-existing') {
+        console.error(yellow + '  [claude-hooks] foreign statusLine preserved — re-run `install-hooks --force` to overwrite' + reset);
+      }
+    } catch (err) {
+      console.error(yellow + '  [claude-hooks] skipped: ' + (err && err.message) + reset);
+    }
+  }
+  console.error(green + '✓ Installation abgeschlossen' + reset);
+  return { mode, dryRun: false, written: Object.keys(newManifest.files).length,
+    backedUp: backupLog.length, deleted: diff.stale.length };
+  } finally {
+    try { fs.rmSync(opencodeTmp, { recursive: true, force: true }); } catch {}
+  }
+}
+
+async function runUninstall(opts) {
+  const options = opts || {};
+  const cwd = options.cwd || process.cwd();
+  const projectRoot = options.projectRoot || cwd;
+  const stateDir = _stateDirFor(projectRoot);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const lockPath = path.join(stateDir, '.install.lock');
+  return withFileLock(lockPath, () => _runUninstallLocked(projectRoot),
+    { timeoutMs: 60000 });
+}
+
+function _runUninstallLocked(projectRoot) {
+  const scope = _readExistingScope(projectRoot) || 'local';
+  const payloadDir = _payloadDirFor(projectRoot, scope);
+  const manifest = manifestMod.readManifest(payloadDir);
+  if (!manifest) {
+    console.error(dim + 'Keine Installation gefunden' + reset);
+    return { uninstalled: false };
+  }
+
+  // Reuse the SAME validator as readManifest so a legitimate key like
+  // `..bar` (no traversal segment) isn't false-rejected here while passing
+  // validation upstream. Single source of truth lives in manifest.cjs.
+  for (const rel of Object.keys(manifest.files)) {
+    manifestMod.assertSafeManifestKey(rel, 'uninstall');
+  }
+
+  const payloadBase = scope === 'global' ? os.homedir() : projectRoot;
+  let removed = 0;
+  const assetDirs = new Set();
+  for (const rel of Object.keys(manifest.files)) {
+    const isAsset = runtimeAssetsMod.isAssetManifestKey(rel);
+    const abs = rel.startsWith('~/')
+      ? path.join(os.homedir(), rel.slice(2))
+      : isAsset ? path.join(payloadBase, rel) : path.join(payloadDir, rel);
+    // Defense-in-depth: even with the validator above, ensure the resolved
+    // path lives inside its expected base. A symlink or future-validator
+    // regression cannot escape this prefix check.
+    const expectedBase = rel.startsWith('~/') ? os.homedir()
+      : isAsset ? payloadBase : payloadDir;
+    const resolvedAbs = path.resolve(abs);
+    const resolvedBase = path.resolve(expectedBase);
+    if (!(resolvedAbs === resolvedBase || resolvedAbs.startsWith(resolvedBase + path.sep))) {
+      throw new NubosPilotError(
+        'manifest-unlink-outside-base',
+        'Refusing unlink that escapes its payload base',
+        { rel, base: path.basename(expectedBase) },
+      );
+    }
+    try {
+      fs.unlinkSync(abs);
+      removed++;
+      if (isAsset) assetDirs.add(path.dirname(abs));
+    } catch (err) {
+      if (err && err.code !== 'ENOENT') {
+        console.error(yellow + '  [uninstall] ' + rel + ' not removed: ' + err.message + reset);
+      }
+    }
+  }
+  const sortedDirs = Array.from(assetDirs).sort((a, b) => b.length - a.length);
+  for (const dir of sortedDirs) {
+    let cur = dir;
+    while (cur && cur.startsWith(payloadBase) && cur !== payloadBase) {
+      try {
+        const entries = fs.readdirSync(cur);
+        if (entries.length > 0) break;
+        fs.rmdirSync(cur);
+      } catch { break; }
+      cur = path.dirname(cur);
+    }
+  }
+
+  try { fs.unlinkSync(path.join(payloadDir, '.manifest.json')); } catch {}
+
+  try { fs.rmdirSync(payloadDir); } catch {}
+
+  let installedRuntimes = [];
+  const cfg = _readInstallConfig(projectRoot);
+  if (cfg) {
+    installedRuntimes = cfg.runtimes || (cfg.runtime ? [cfg.runtime] : []);
+  }
+
+  const legacyFiles = ['CLAUDE.md', 'AGENTS.md', 'GEMINI.md'];
+  const extraFiles = [];
+  for (const id of installedRuntimes) {
+    if (LEGACY_AGENTS.has(id)) continue;
+    const meta = registryMod.getRuntimeMeta(id);
+    if (!meta) continue;
+    extraFiles.push(registryMod.runtimeAgentsPath(meta, 'local', projectRoot));
+  }
+
+  const toStrip = legacyFiles
+    .map((n) => path.join(projectRoot, n))
+    .concat(extraFiles);
+  for (const p of toStrip) {
+    if (!fs.existsSync(p)) continue;
+    const stripped = managedBlockMod.stripBlock(fs.readFileSync(p, 'utf-8'));
+    if (!stripped || !stripped.trim()) {
+      try { fs.unlinkSync(p); } catch {}
+    } else {
+      atomicWriteFileSync(p, stripped);
+    }
+  }
+
+  const opencodeDir = _opencodePayloadDirFor(projectRoot, scope);
+  if (fs.existsSync(opencodeDir)) {
+    try { fs.rmSync(opencodeDir, { recursive: true, force: true }); } catch {}
+  }
+  const opencodeParent = path.dirname(opencodeDir);
+  try { fs.rmdirSync(opencodeParent); } catch {}
+
+  console.error(green + '✓ Uninstall abgeschlossen' + reset);
+  let leftovers = [];
+  try {
+    if (fs.existsSync(payloadDir)) {
+      leftovers = fs.readdirSync(payloadDir).filter((f) => /\.bak(\.\d+|\.orphan-)?$/.test(f));
+    }
+  } catch {}
+  if (leftovers.length) {
+    console.error(dim + '  User-Backups belassen:' + reset);
+    for (const f of leftovers) console.error(dim + '    ' + f + reset);
+  }
+  return { uninstalled: true, removed, leftoverBaks: leftovers };
+}
+
+async function main() {
+  const rawArgs = process.argv.slice(2);
+  if (rawArgs.includes('--version') || rawArgs.includes('-v')) {
+    let version = '0.0.0';
+    try { version = String(require('../package.json').version || '0.0.0'); } catch {}
+    process.stdout.write(version + '\n');
+    return;
+  }
+  const { flags, rest } = parseInstallFlags(rawArgs);
+  const sub = rest[0];
+  const cwd = process.cwd();
+  switch (sub) {
+    case undefined:
+      return await runInstall({ cwd, mode: detectMode(cwd), flags });
+    case '--dry-run':
+      return await runInstall({ cwd, mode: detectMode(cwd), dryRun: true, flags });
+    case 'update': {
+      const detected = detectMode(cwd);
+      return await runInstall({ cwd, mode: detected === 'init' ? 'init' : 'update', flags });
+    }
+    case 'uninstall':
+      return await runUninstall({ cwd, args: rest.slice(1) });
+    case 'doctor': {
+      const doctor = require('./np-tools/doctor.cjs');
+      return await doctor.run(rest.slice(1), { cwd, stdout: process.stdout });
+    }
+    case 'install-hooks':
+      return await runInstallHooks({ cwd, args: rest.slice(1) });
+    case 'uninstall-hooks':
+      return await runUninstallHooks({ cwd, args: rest.slice(1) });
+    default:
+      process.stderr.write(
+        red + 'Unbekanntes Subcommand: ' + sub + reset + '\n',
+      );
+      process.exit(1);
+      return undefined;
+  }
+}
+
+function _parseHookFlags(args) {
+  const flags = { scope: null, which: 'both', force: false, dryRun: false };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--scope' || a === '-s') { flags.scope = args[++i] || null; continue; }
+    if (a.startsWith('--scope=')) { flags.scope = a.slice('--scope='.length); continue; }
+    if (a === '--statusline-only') { flags.which = 'statusline'; continue; }
+    if (a === '--ctx-monitor-only') { flags.which = 'ctx-monitor'; continue; }
+    if (a === '--force' || a === '-f') { flags.force = true; continue; }
+    if (a === '--dry-run') { flags.dryRun = true; continue; }
+  }
+  if (flags.scope && !VALID_SCOPES.includes(flags.scope)) {
+    throw new NubosPilotError('invalid-flag',
+      '--scope must be one of: ' + VALID_SCOPES.join(', '),
+      { flag: '--scope', got: flags.scope });
+  }
+  return flags;
+}
+
+async function runInstallHooks(opts) {
+  const o = opts || {};
+  const projectRoot = o.projectRoot || o.cwd || process.cwd();
+  const flags = _parseHookFlags(o.args || []);
+  const scope = flags.scope || _readExistingScope(projectRoot) || 'local';
+  const claudeHooks = require('../lib/install/claude-hooks.cjs');
+  const res = claudeHooks.installClaudeHooks({
+    projectRoot, scope, which: flags.which, force: flags.force, dryRun: flags.dryRun,
+  });
+  if (res.dryRun) {
+    process.stdout.write(JSON.stringify({ dryRun: true, path: res.path, results: res.results }, null, 2) + '\n');
+    return res;
+  }
+  console.error(green + '✓ Claude Code hooks geschrieben → ' + res.path + reset);
+  if (res.results.statusline) {
+    console.error(dim + '  statusline: ' + res.results.statusline.action
+      + (res.results.statusline.existingCommand ? ' (existing: ' + res.results.statusline.existingCommand + ')' : '')
+      + reset);
+  }
+  if (res.results.ctxMonitor) {
+    console.error(dim + '  ctx-monitor: ' + res.results.ctxMonitor.action + reset);
+  }
+  if (res.results.statusline && res.results.statusline.action === 'skipped-existing') {
+    console.error(yellow + '  [statusline] existing non-nubos statusLine preserved. Pass --force to overwrite.' + reset);
+  }
+  return res;
+}
+
+async function runUninstallHooks(opts) {
+  const o = opts || {};
+  const projectRoot = o.projectRoot || o.cwd || process.cwd();
+  const flags = _parseHookFlags(o.args || []);
+  const scope = flags.scope || _readExistingScope(projectRoot) || 'local';
+  const claudeHooks = require('../lib/install/claude-hooks.cjs');
+  const res = claudeHooks.uninstallClaudeHooks({ projectRoot, scope, dryRun: flags.dryRun });
+  if (res.dryRun) {
+    process.stdout.write(JSON.stringify({ dryRun: true, path: res.path, results: res.results }, null, 2) + '\n');
+    return res;
+  }
+  console.error(green + '✓ Claude Code hooks entfernt ← ' + res.path + reset);
+  console.error(dim + '  statusline: ' + res.results.statusline.action + reset);
+  console.error(dim + '  ctx-monitor: ' + res.results.ctxMonitor.action + reset);
+  return res;
+}
+
+if (require.main === module) {
+  if (Number(process.versions.node.split('.')[0]) < 22) {
+    process.stderr.write('nubos-pilot: requires Node >= 22 (running ' + process.versions.node + ')\n');
+    process.exit(1);
+  }
+  installSignalCleanup();
+  main().catch((err) => {
+    const payload = (err && err.code)
+      ? JSON.stringify({ error: { code: err.code, message: err.message, details: err.details || null } }) + '\n'
+      : ((err && err.stack) || String(err)) + '\n';
+    // Drain stderr before exit. process.exit() can otherwise tear down the
+    // pipe mid-flush on busy CI, truncating the envelope. Set exitCode and
+    // let Node drain naturally; force-exit only as a last-resort fallback.
+    try { process.stderr.write(payload); } catch {}
+    process.exitCode = 1;
+    setTimeout(() => process.exit(1), 1000).unref();
+  });
+}
+
+module.exports = {
+  runInstall, runUninstall, detectMode, main,
+  parseInstallFlags,
+  VALID_AGENTS, VALID_SCOPES,
+  SOURCE_PAYLOAD_DIR, PAYLOAD_SUBPATH, STATE_SUBPATH,
+  _payloadDirFor, _stateDirFor,
+};

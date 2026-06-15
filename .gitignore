@@ -1,0 +1,6 @@
+node_modules/
+coverage/
+.nubos-pilot/
+.claude/
+.planning/
+CLAUDE.md

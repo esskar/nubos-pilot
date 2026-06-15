@@ -1,0 +1,128 @@
+'use strict';
+
+const fs = require('node:fs');
+const { NubosPilotError } = require('../../lib/core.cjs');
+const { TASK_ID_RE } = require('../../lib/ids.cjs');
+const { readState } = require('../../lib/state.cjs');
+const { restoreFiles } = require('../../lib/git.cjs');
+const { deleteCheckpoint, finishTask, listCheckpoints } = require('../../lib/checkpoint.cjs');
+const layout = require('../../lib/layout.cjs');
+const { extractFrontmatter } = require('../../lib/frontmatter.cjs');
+const {
+  hasSliceWorktree,
+  removeSliceWorktree,
+  worktreeIsolationEnabled,
+} = require('../../lib/worktree.cjs');
+
+function _resolveTaskId(explicit, cwd) {
+  if (explicit) {
+    if (!TASK_ID_RE.test(explicit)) {
+      throw new NubosPilotError(
+        'reset-slice-invalid-task-id',
+        'Invalid task id: ' + explicit + ' (expected M<NNN>-S<NNN>-T<NNNN>)',
+        { taskId: explicit },
+      );
+    }
+    return explicit;
+  }
+  let state;
+  try { state = readState(cwd); } catch (err) {
+    throw new NubosPilotError(
+      'reset-slice-no-state',
+      'STATE.md not readable — run in a nubos-pilot project',
+      { cause: err && err.code },
+    );
+  }
+  const current = state.frontmatter && state.frontmatter.current_task;
+  if (typeof current !== 'string' || !TASK_ID_RE.test(current)) {
+    return null;
+  }
+  return current;
+}
+
+function _readTaskFiles(taskId, cwd) {
+  const parsed = layout.parseTaskFullId(taskId);
+  const planPath = layout.taskPlanPath(parsed.milestone, parsed.slice, parsed.task, cwd);
+  if (!fs.existsSync(planPath)) return [];
+  const raw = fs.readFileSync(planPath, 'utf-8');
+  const { frontmatter } = extractFrontmatter(raw);
+  return Array.isArray(frontmatter.files_modified) ? frontmatter.files_modified : [];
+}
+
+function _maybeRemoveWorktreeForTask(taskId, cwd) {
+  if (!worktreeIsolationEnabled(cwd)) return null;
+  let parsed;
+  try { parsed = layout.parseTaskFullId(taskId); } catch { return null; }
+  const sliceFullId = layout.sliceFullId(parsed.milestone, parsed.slice);
+  let exists = false;
+  try { exists = hasSliceWorktree(sliceFullId, cwd); } catch { exists = false; }
+  if (!exists) return null;
+  try {
+    return removeSliceWorktree(sliceFullId, cwd, { force: true });
+  } catch (err) {
+    process.stderr.write(
+      '[nubos-pilot warn] removeSliceWorktree failed for ' + sliceFullId + ': ' + ((err && err.message) || err) + '\n',
+    );
+    return null;
+  }
+}
+
+function run(args, ctx) {
+  const context = ctx || {};
+  const cwd = context.cwd || process.cwd();
+  const stdout = context.stdout || process.stdout;
+  const list = Array.isArray(args) ? args : [];
+
+  const keepWorktree = list.includes('--keep-worktree');
+  const positional = list.filter((a) => a && !a.startsWith('--'));
+  const explicit = positional[0] || null;
+  const taskId = _resolveTaskId(explicit, cwd);
+
+  if (!taskId) {
+    let orphans = [];
+    try { orphans = listCheckpoints(cwd) || []; } catch { orphans = []; }
+    for (const cp of orphans) {
+      try { deleteCheckpoint(cp.task_id, cwd); } catch {}
+    }
+    const payload = {
+      ok: true,
+      task_id: null,
+      restored_files: [],
+      deleted_checkpoints: orphans.map((c) => c.task_id),
+      message: 'no current_task — cleared ' + orphans.length + ' orphan checkpoint(s)',
+    };
+    stdout.write(JSON.stringify(payload) + '\n');
+    return payload;
+  }
+
+  const files = _readTaskFiles(taskId, cwd);
+  if (files.length > 0) {
+    try { restoreFiles(files); } catch (err) {
+      require('../../lib/logger.cjs').child('reset-slice').warn('restoreFiles failed', {
+        event: 'reset-slice-restore-failed', cause: err && err.message,
+      });
+    }
+  }
+
+  try { finishTask(taskId, cwd); } catch (err) {
+    require('../../lib/logger.cjs').child('reset-slice').warn('finishTask failed', {
+      event: 'reset-slice-finish-failed', cause: err && err.message,
+    });
+  }
+
+  const worktreeRemoved = keepWorktree ? null : _maybeRemoveWorktreeForTask(taskId, cwd);
+
+  const payload = {
+    ok: true,
+    task_id: taskId,
+    restored_files: files,
+    deleted_checkpoints: [taskId],
+    worktree_removed: worktreeRemoved,
+    message: 'in-flight task discarded; working tree restored to HEAD'
+      + (worktreeRemoved ? '; worktree ' + worktreeRemoved.branch + ' removed' : ''),
+  };
+  stdout.write(JSON.stringify(payload) + '\n');
+  return payload;
+}
+
+module.exports = { run };
