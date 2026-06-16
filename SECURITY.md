@@ -18,11 +18,10 @@ versions and announced in `CHANGELOG.md`.
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.x   | ✅ active |
-| < 0.2   | ❌ end of life |
+| 1.2.x   | ✅ active |
+| < 1.2   | ❌ end of life |
 
-Only the latest minor on the current major receives security patches until
-1.0 is reached.
+Only the latest minor on the current major (1.x) receives security patches.
 
 ## Threat Model
 

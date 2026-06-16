@@ -5,7 +5,7 @@
 ```sh
 node --version   # must be >= 22
 npm install
-npm test         # 1600+ tests; runs in ~13s
+npm test         # 1800+ tests; runs in ~13s
 ```
 
 ## Code Conventions
