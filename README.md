@@ -95,7 +95,7 @@ task(M001-S001-T0002): wire login handler
 
 ## Agents
 
-Thirteen spawnable subagents are installed into the host's agent directory (alongside three `np-critic-*` audit modules consumed by `np-critic`):
+Fourteen spawnable subagents are installed into the host's agent directory (alongside three `np-critic-*` audit modules consumed by `np-critic`):
 
 - `np-planner` (opus) — breaks a milestone into slices + tasks
 - `np-plan-checker` (opus) — adversarial goal-backward review before execution
@@ -109,6 +109,7 @@ Thirteen spawnable subagents are installed into the host's agent directory (alon
 - `np-critic` (sonnet) — Nubosloop critic; audits executor output across style, tests and acceptance
 - `np-verifier` (sonnet) — post-execution Pass/Fail/Defer per success_criterion
 - `np-nyquist-auditor` (haiku) — requirement test-coverage audit
+- `np-learnings-extractor` (haiku) — headless continuous-learning observer; distils reusable `{pattern, outcome}` learnings from a session's turn-diff
 - `np-security-reviewer` (sonnet) — OWASP-aligned read-only audit (manual spawn)
 
 Every spawn runs with an **explicit tier** (`haiku` / `sonnet` / `opus`) resolved to a concrete model via `np-tools.cjs resolve-model --profile <frontier|quality|balanced|budget|inherit>`.
